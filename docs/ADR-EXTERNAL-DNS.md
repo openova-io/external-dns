@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2024-10-01
-**Updated:** 2026-01-16
+**Updated:** 2026-01-17
 
 ## Context
 
@@ -10,11 +10,12 @@ Need automated DNS record management that:
 - Syncs Kubernetes resources to external DNS providers
 - Works with multiple DNS providers (Cloudflare, Hetzner, Route53, etc.)
 - Integrates with k8gb for GSLB functionality
+- Creates NS records for k8gb authoritative DNS delegation
 - Supports multi-region deployments
 
 ## Decision
 
-Use **ExternalDNS** for automated DNS record synchronization from Kubernetes to external DNS providers.
+Use **ExternalDNS** for automated DNS record synchronization from Kubernetes to external DNS providers. ExternalDNS manages the **parent zone** and creates NS records delegating to **k8gb CoreDNS** for the GSLB zone.
 
 ## Architecture
 
@@ -22,59 +23,70 @@ Use **ExternalDNS** for automated DNS record synchronization from Kubernetes to 
 flowchart TB
     subgraph K8s["Kubernetes Cluster"]
         SVC[Services]
-        ING[Ingress]
+        GW[Cilium Gateway]
         GSLB[Gslb CRD]
         EDNS[ExternalDNS]
+        K8GB[k8gb CoreDNS<br/>Authoritative]
     end
 
-    subgraph Providers["DNS Providers"]
-        CF[Cloudflare]
-        HZ[Hetzner DNS]
-        R53[Route53]
-        CDNS[Cloud DNS]
-        ADNS[Azure DNS]
+    subgraph Providers["DNS Provider (Parent Zone)"]
+        CF[Cloudflare / Hetzner DNS]
     end
 
     SVC -->|"Watch"| EDNS
-    ING -->|"Watch"| EDNS
+    GW -->|"Watch"| EDNS
     GSLB -->|"Watch"| EDNS
-    EDNS -->|"Sync records"| CF
-    EDNS -->|"Sync records"| HZ
-    EDNS -->|"Sync records"| R53
-    EDNS -->|"Sync records"| CDNS
-    EDNS -->|"Sync records"| ADNS
+    EDNS -->|"Create NS records"| CF
+    CF -->|"Delegate gslb.example.com"| K8GB
 ```
 
 ## Integration with k8gb
 
-ExternalDNS and k8gb work together for multi-region DNS:
+### DNS Hierarchy
+
+ExternalDNS and k8gb work together:
+
+```
+example.com                    → DNS Provider (managed by ExternalDNS)
+  ├── app.example.com          → A record (direct, via ExternalDNS)
+  ├── api.example.com          → A record (direct, via ExternalDNS)
+  └── gslb.example.com (NS)    → k8gb CoreDNS (authoritative)
+        ├── web.gslb.example.com   → Health-based IPs (k8gb)
+        └── svc.gslb.example.com   → Health-based IPs (k8gb)
+```
+
+### Responsibilities
+
+| Component | Responsibility |
+|-----------|---------------|
+| ExternalDNS | Parent zone records, NS delegation to k8gb |
+| k8gb | Authoritative DNS for GSLB zone, health-based routing |
+
+### Multi-Region Flow
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph Region1["Region 1"]
-        K8GB1[k8gb]
+        K8GB1[k8gb CoreDNS]
         EDNS1[ExternalDNS]
     end
 
     subgraph Region2["Region 2"]
-        K8GB2[k8gb]
+        K8GB2[k8gb CoreDNS]
         EDNS2[ExternalDNS]
     end
 
     subgraph DNS["DNS Provider"]
-        Records[DNS Records]
+        Parent[Parent Zone]
+        NS[NS Records]
     end
 
     K8GB1 <-->|"Health sync"| K8GB2
-    K8GB1 -->|"Update Gslb"| EDNS1
-    K8GB2 -->|"Update Gslb"| EDNS2
-    EDNS1 -->|"Sync"| Records
-    EDNS2 -->|"Sync"| Records
+    EDNS1 -->|"Create NS"| NS
+    EDNS2 -->|"Create NS"| NS
+    NS -->|"Delegate"| K8GB1
+    NS -->|"Delegate"| K8GB2
 ```
-
-**Responsibilities:**
-- **k8gb**: Health checking, GSLB logic, determines which IPs are healthy
-- **ExternalDNS**: Syncs the resulting DNS records to the provider
 
 ## Supported DNS Providers
 
@@ -136,7 +148,7 @@ spec:
 ```yaml
 args:
   - --provider=cloudflare
-  - --cloudflare-proxied  # optional: enable Cloudflare proxy
+  # Note: No --cloudflare-proxied (DDoS via cloud provider native)
 env:
   - name: CF_API_TOKEN
     valueFrom:
@@ -177,13 +189,25 @@ env:
         key: secret-access-key
 ```
 
+## NS Record Creation for k8gb
+
+ExternalDNS creates NS records pointing to k8gb LoadBalancer IPs:
+
+```yaml
+# Managed by ExternalDNS in parent zone
+gslb.example.com.        NS    ns1.gslb.example.com.
+gslb.example.com.        NS    ns2.gslb.example.com.
+ns1.gslb.example.com.    A     <k8gb-region1-lb-ip>
+ns2.gslb.example.com.    A     <k8gb-region2-lb-ip>
+```
+
 ## TXT Record Ownership
 
 ExternalDNS uses TXT records to track ownership:
 
 ```
-app.example.com.           A     1.2.3.4
-externaldns-app.example.com. TXT   "heritage=external-dns,external-dns/owner=tenant-region1"
+app.example.com.              A     1.2.3.4
+externaldns-app.example.com.  TXT   "heritage=external-dns,external-dns/owner=tenant-region1"
 ```
 
 This prevents:
@@ -200,6 +224,10 @@ This prevents:
 
 **Recommended:** `sync` for full automation
 
+## DDoS Protection
+
+**Note:** Cloudflare proxy mode (`--cloudflare-proxied`) is NOT used. DDoS protection is handled by cloud provider native solutions (Hetzner Firewall, etc.).
+
 ## Consequences
 
 **Positive:**
@@ -207,6 +235,7 @@ This prevents:
 - Multi-provider support
 - Native k8gb integration
 - GitOps-friendly (declarative)
+- NS delegation enables k8gb authoritative DNS
 
 **Negative:**
 - Requires DNS provider API credentials
@@ -217,3 +246,4 @@ This prevents:
 
 - [ADR-K8GB-GSLB](../../k8gb/docs/ADR-K8GB-GSLB.md)
 - [SPEC-DNS-FAILOVER](../../handbook/docs/specs/SPEC-DNS-FAILOVER.md)
+- [SPEC-SPLIT-BRAIN-PROTECTION](../../handbook/docs/specs/SPEC-SPLIT-BRAIN-PROTECTION.md)

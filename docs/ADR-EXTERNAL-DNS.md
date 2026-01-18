@@ -23,7 +23,7 @@ Use **ExternalDNS** for automated DNS record synchronization from Kubernetes to 
 flowchart TB
     subgraph K8s["Kubernetes Cluster"]
         SVC[Services]
-        GW[Cilium Gateway]
+        GW[Gateway API]
         GSLB[Gslb CRD]
         EDNS[ExternalDNS]
         K8GB[k8gb CoreDNS<br/>Authoritative]
